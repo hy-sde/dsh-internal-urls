@@ -13,8 +13,8 @@ This is the oh-my-pi `internal-urls` system (portal `port_omp.md`) ported onto
 the harness as a **standalone plugin with zero upstream harness changes**: the
 registry row ships as a `cordis.patch.yml` bundle, the routing tools ship as
 agent-scope shadows in a ready-to-copy preset, and every `@deepseek-ai`
-dependency resolves from the npm registry at the `0.1.1-rc.2` baseline — so
-it installs on official DeepSeek Harness releases (`dsh-v0.1.1-rc.2` and
+dependency resolves from the npm registry at the `0.1.2-alpha.1` baseline — so
+it installs on official DeepSeek Harness releases (`dsh-v0.1.2-alpha.1` and
 later) exactly as it runs in the hy-sde fork.
 
 ## Why shadows, not replaced tools
@@ -36,7 +36,7 @@ pnpm install --global @deepseek-ai/dsh
 ### Direct from npm (published)
 
 All three packages are published on the npm registry under the `hy-sde-org`
-organization (version `0.1.1-rc.2`):
+organization (version `0.1.2-alpha.1`):
 
 ```bash
 dsh plugin --profile web add @hy-sde-org/dsh-internal-urls \
