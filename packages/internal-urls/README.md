@@ -10,7 +10,7 @@ a **standalone plugin**: the registry row installs via `cordis.patch.yml`, and
 the routing tools install as agent-scope shadows
 (`@hy-sde-org/dsh-tool-fs-internal-urls` /
 `@hy-sde-org/dsh-tool-fs-search-internal-urls`). Nothing in the upstream
-DeepSeek Harness (`dsh-v0.1.2-alpha.1` and later) needs to change.
+DeepSeek Harness (`dsh-v0.1.2-rc.1` and later) needs to change.
 
 ## URL shapes
 
@@ -35,7 +35,7 @@ pnpm install --global @deepseek-ai/dsh
 ### Direct from npm (published)
 
 All three packages are published on the npm registry under the `hy-sde-org`
-organization (version `0.1.2-alpha.1`). Add the service, then mount the routing
+organization (version `0.1.2-rc.1`). Add the service, then mount the routing
 tools via a preset:
 
 ```bash

@@ -64,7 +64,7 @@ interface WriteToolArgs {
 export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void {
   ctx.systemPrompt.section({
     name: 'tool:write',
-    order: 101,
+    order: ctx.systemPrompt.getSectionOrder('TOOL_WRITE'),
     text: 'Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.',
   })
 

@@ -20,7 +20,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { isAbsolute, relative, sep } from 'node:path'
+import { isAbsolute, join, parse, relative, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import { ItemRetainer, TextRetainer } from '@deepseek-ai/dsh-output-retention'
@@ -170,7 +170,10 @@ let rgPathPromise: Promise<string> | undefined
  */
 export function resolveRgPath(): Promise<string> {
   rgPathPromise ??= Promise.resolve().then(async () => {
-    const executableSidecar = `${process.execPath}-rg`
+    const executable = parse(process.execPath)
+    const executableSidecar = process.platform === 'win32'
+      ? join(executable.dir, `${executable.name}-rg.exe`)
+      : `${process.execPath}-rg`
     if ('pkg' in process && existsSync(executableSidecar)) return executableSidecar
     return (await import('@vscode/ripgrep')).rgPath
   })
@@ -303,6 +306,126 @@ export interface GrepMatch {
   path: string
   lineNumber: number
   line: string
+}
+
+/**
+ * Git-dirty files discovered by one `git status` probe: display path → compact
+ * porcelain status code (`M`, `MM`, `A`, `D`, `??`, `R`, …).
+ */
+export type GitDirtyMap = Map<string, string>
+
+/**
+ * Parse `git status --porcelain=v1 -z` output (as git emits it for
+ * `--untracked-files=all`) into the dirty-file map. Rename/copy v1 `-z` format
+ * is TWO NUL-separated records — `XY <new>\0<old>\0` — so the bare old-path
+ * record after a rename entry is consumed, not parsed as a status line.
+ *
+ * @param text - the complete porcelain output.
+ * @returns every dirty path → its compact status code (leading/trailing status
+ *   whitespace trimmed).
+ */
+export function parsePorcelainV1Z(text: string): GitDirtyMap {
+  const dirty: GitDirtyMap = new Map()
+  const tokens = text.split('\0')
+  let consumingRenameTarget = false
+  for (const token of tokens) {
+    if (token.length === 0) continue
+    if (consumingRenameTarget) {
+      // The bare old path that follows a `R…`/`C…` record; nothing to keep.
+      consumingRenameTarget = false
+      continue
+    }
+    if (token.length < 3 || token[2] !== ' ') continue
+    const status = token.slice(0, 2)
+    if (status[0] === 'R' || status[0] === 'C') {
+      const code = status.trim()
+      if (code.length > 0) dirty.set(token.slice(3), code)
+      consumingRenameTarget = true
+      continue
+    }
+    const code = status.trim()
+    if (code.length > 0) dirty.set(token.slice(3), code)
+  }
+  return dirty
+}
+
+/**
+ * Probe the worktree at the resolved workdir for git-dirty files (modified,
+ * staged, added, deleted, renamed, or untracked). Anything short of a
+ * successful porcelain run — no `git` on PATH, a non-repo workdir, a killed
+ * process, output beyond the capture budget — returns `undefined` and ranking
+ * is simply skipped: git-aware ordering is a UX aid, never a search failure.
+ *
+ * The argv is fixed and model-free. `-c alias.status=status`,
+ * `-c status.relativePaths=true`, and `-c core.quotepath=false` pin the
+ * builtin, cwd-relative, unquoted output so a host git config cannot redirect
+ * the alias into a shell alias (the same class of injection the `--no-config`
+ * prepend guards against for ripgrep), and `--no-pager` keeps a pager from
+ * ever blocking the collect streams.
+ *
+ * @param ctx - the plugin context; execution uses its `subprocess` service.
+ * @param exec - the tool-execution context; supplies the session cwd and abort signal.
+ * @returns the dirty-path status map, or `undefined` when the probe cannot run cleanly.
+ */
+export async function gitDirtyPaths(ctx: Context, exec: ToolExecution): Promise<GitDirtyMap | undefined> {
+  if (exec.signal.aborted) return undefined
+  const cwd = exec.agent?.session.header.cwd
+  const workdir = cwd ?? process.cwd()
+  let handle: SubprocessHandle
+  try {
+    handle = ctx.subprocess.spawn({
+      argv: ['git', '--no-pager', '-c', 'alias.status=status', '-c', 'status.relativePaths=true', '-c', 'core.quotepath=false',
+        'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+      cwd: workdir,
+      stdio: {
+        stdin: 'ignore',
+        stdout: { maxBytes: 1_048_576 },
+        stderr: { maxBytes: 8192 },
+      },
+      graceMs: 3_000,
+      signal: exec.signal,
+    } satisfies SubprocessSpawnSpec)
+  } catch {
+    return undefined
+  }
+  let outcome: SubprocessOutcome
+  try {
+    outcome = await handle.done
+  } catch {
+    return undefined
+  }
+  if (outcome.signal !== null || outcome.exitCode !== 0) return undefined
+  const stdout = handle.collected.stdout?.readFrom(0)
+  if (stdout === undefined || stdout.lossy) return undefined
+  return parsePorcelainV1Z(stdout.text)
+}
+
+/**
+ * Rank a flat match list so every match under a git-dirty path comes first,
+ * preserving the relative order of matches within each partition (ripgrep
+ * emits one file's matches contiguously, so the front keeps its per-file
+ * groups intact and the back follows, both in first-seen order). This is the
+ * fork's index-free stand-in for fff's git-aware weighting: when the model is
+ * mid-task, the files it just touched surface on page one instead of being
+ * buried behind 30 lines of `TODO` noise in untouched files. Paths are
+ * compared separator-normalized for Windows safety.
+ *
+ * @param matches - the parsed matches, in ripgrep output order.
+ * @param dirty - the git-dirty path map from {@link gitDirtyPaths}.
+ * @returns the reordered matches: dirty-path matches first.
+ */
+export function rankGrepMatchesByDirty(matches: GrepMatch[], dirty: GitDirtyMap): GrepMatch[] {
+  if (dirty.size === 0) return matches
+  const dirtyPaths = new Set<string>()
+  for (const path of dirty.keys()) dirtyPaths.add(path.split(sep).join('/'))
+  const front: GrepMatch[] = []
+  const back: GrepMatch[] = []
+  for (const match of matches) {
+    if (dirtyPaths.has(match.path.split(sep).join('/'))) front.push(match)
+    else back.push(match)
+  }
+  if (front.length === 0) return matches
+  return front.concat(back)
 }
 
 /**

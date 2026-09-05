@@ -40,14 +40,17 @@ export {
   GREP_MAX_MATCHES,
   applyGrepTool,
   buildGrepCommand,
+  cursorToken,
   formatGrepMatches,
   formatGrepOutput,
+  parseCursorToken,
   parseGrepArgs,
   parseGrepMatches,
   presentGrepCall,
   presentGrepResult,
+  sliceGrepPage,
 } from './grep.ts'
-export type { GrepInput, GrepToolCaps } from './grep.ts'
+export type { GrepInput, GrepPage, GrepToolCaps } from './grep.ts'
 export {
   RAW_OUTPUT_MAX_BYTES,
   SEARCH_GRACE_MS,
@@ -55,13 +58,16 @@ export {
   SEARCH_STDERR_MAX_BYTES,
   SEARCH_TIMEOUT_MS,
   SearchError,
+  gitDirtyPaths,
+  parsePorcelainV1Z,
   previewLine,
+  rankGrepMatchesByDirty,
   resolveRgPath,
   runRipgrep,
   toWorkdirRelative,
   trySaveFormattedResult,
 } from './search-core.ts'
-export type { GrepMatch, RipgrepRun, SearchErrorCode } from './search-core.ts'
+export type { GitDirtyMap, GrepMatch, RipgrepRun, SearchErrorCode } from './search-core.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'tool-fs-search'
@@ -75,10 +81,13 @@ export interface Config {
   sampleOverCapGlobResults: boolean
   /** Max paths one `glob` call retains inline; later paths go to the formatted spill file. */
   globMaxResults?: number
-  /** Max flat matches one `grep` call retains inline; later matches go to the formatted spill file. */
+  /** Max flat matches one `grep` call retains inline (the page size); later matches ride the continuation
+   * cursor and the formatted spill file. */
   grepMaxMatches?: number
   /** Max bytes retained for one matched-line preview (the cut preserves UTF-8 boundaries). */
   grepMaxLineBytes?: number
+  /** Whether one `git status` probe per call ranks git-dirty files first and annotates them `[M in git]`. */
+  grepGitRank?: boolean
   /** Max bytes of one search's serialized `presentationMeta`; trailing groups/paths drop past it so the persisted card stays bounded. */
   searchMetaMaxBytes?: number
   /** Max complete raw `rg` stdout bytes a search will parse; larger raw output fails with `SEARCH_RAW_OUTPUT_OVERFLOW`. */
@@ -99,6 +108,7 @@ export const Config: z<Config> = z.object({
   globMaxResults: z.number().default(GLOB_MAX_RESULTS),
   grepMaxMatches: z.number().default(GREP_MAX_MATCHES),
   grepMaxLineBytes: z.number().default(GREP_MAX_LINE_BYTES),
+  grepGitRank: z.boolean().default(true),
   searchMetaMaxBytes: z.number().default(SEARCH_META_MAX_BYTES),
   rawOutputMaxBytes: z.number().default(RAW_OUTPUT_MAX_BYTES),
   graceMs: z.number().default(SEARCH_GRACE_MS),
@@ -151,6 +161,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   applyGrepTool(ctx, {
     maxMatches: resolved.grepMaxMatches,
     maxLineBytes: resolved.grepMaxLineBytes,
+    gitRank: resolved.grepGitRank,
     maxMetaBytes: resolved.searchMetaMaxBytes,
     rawOutputMaxBytes: resolved.rawOutputMaxBytes,
     graceMs: resolved.graceMs,

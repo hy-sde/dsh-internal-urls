@@ -17,29 +17,42 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, SearchResultView, ToolResult } from '@deepseek-ai/dsh-tools'
-import type { RetainedItems } from '@deepseek-ai/dsh-output-retention'
 import type { SpillRef } from '@deepseek-ai/dsh-spill'
-import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@hy-sde-org/dsh-internal-urls'
 import type { InternalResource } from '@hy-sde-org/dsh-internal-urls'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { GrepMatch } from './search-core.ts'
-import { SearchError, previewLine, retainGrepMatches, runRipgrep, toWorkdirRelative, trySaveFormattedResult } from './search-core.ts'
+import { SearchError, gitDirtyPaths, previewLine, rankGrepMatchesByDirty, runRipgrep, toWorkdirRelative, trySaveFormattedResult } from './search-core.ts'
 import { grepSearchMeta, searchViewFromMeta } from './presentation.ts'
 import { acceptedDirectCallValue } from './direct-call.ts'
 
 /**
  * Default cap on flat matches retained inline by one `grep` call (the
- * `grepMaxMatches` config), matching Claude Code's default `GrepTool`
- * `head_limit`.
+ * `grepMaxMatches` config): the inline PAGE SIZE of a result. 250→50 is the
+ * fff/philosophy imported from a search-tool audit (pi-fff's default is 20):
+ * a broad grep must hand back a small, ranked, pageable first screen, not a
+ * 50KB flood that buries the files that matter. Capped results return a
+ * continuation `cursor` and — with a spill backend — the complete result's
+ * locator.
  */
-export const GREP_MAX_MATCHES = 250
+export const GREP_MAX_MATCHES = 50
 
-/**
- * Default cap in bytes on one matched-line preview (the `grepMaxLineBytes`
- * config); the cut preserves UTF-8 boundaries.
- */
+/** Default cap in bytes on one matched-line preview (the `grepMaxLineBytes` config); the cut preserves UTF-8 boundaries. */
 export const GREP_MAX_LINE_BYTES = 2000
+
+/** The page slice one `grep` call shows: every match from the cursor offset up to the page size. */
+export interface GrepPage {
+  /** The page's matches, each line previewed to the per-line budget. */
+  items: GrepMatch[]
+  /** Every match the search found (the pre-page total). */
+  seen: number
+  /** Whether more pages exist past this one. */
+  truncated: boolean
+  /** The flat-match offset this page begins at (0 for the first page). */
+  offset: number
+  /** The page size this call slices with (the `grepMaxMatches` config). */
+  pageSize: number
+}
 
 /** Resolved grep-tool caps — plugin config after defaulting (see `Config` in index.ts). */
 export interface GrepToolCaps {
@@ -47,6 +60,8 @@ export interface GrepToolCaps {
   maxMatches: number
   /** Max bytes retained per matched-line preview. */
   maxLineBytes: number
+  /** Whether one `git status` probe per call ranks git-dirty files first (the fff git-aware signal). */
+  gitRank: boolean
   /** Max bytes of serialized `presentationMeta`; trailing file groups drop past it. */
   maxMetaBytes: number
   /** Cap on the complete raw `rg` stdout the tool will parse. */
@@ -64,6 +79,36 @@ export interface GrepInput {
   pattern: string
   path?: string
   include?: string
+  cursor?: string
+}
+
+/**
+ * The opaque cursor grammar: `offset:<n>`. The tool is the only producer and
+ * consumer — the model treats the token as opaque, fff-style, never parses it
+ * (a stateless offset lets every page re-run ripgrep deterministically, no
+ * server-side cursor store needed).
+ *
+ * @param offset - the flat-match offset the cursor encodes.
+ * @returns the opaque continuation token for that offset.
+ */
+export function cursorToken(offset: number): string {
+  return `offset:${offset}`
+}
+
+/**
+ * Parse a continuation cursor into its flat-match offset. A malformed token
+ * (not `offset:<n>`) is an ordinary argument error: the model may only pass
+ * back a token a previous `grep` result returned.
+ *
+ * @param cursor - the opaque continuation token.
+ * @returns the flat-match offset the token encodes.
+ */
+export function parseCursorToken(cursor: string): number {
+  const match = /^offset:(\d+)$/.exec(cursor)
+  if (match === null) {
+    throw new Error('cursor must be a continuation token returned by a previous grep result; pass it back unchanged with the same pattern, path, and include')
+  }
+  return Number(match[1])
 }
 
 /**
@@ -93,14 +138,16 @@ function validateInclude(include: string): void {
  * @param args - the schema-validated `grep` arguments.
  * @returns the accepted input, unchanged.
  */
-export function parseGrepArgs(args: { pattern: string; path?: string; include?: string }): GrepInput {
+export function parseGrepArgs(args: { pattern: string; path?: string; include?: string; cursor?: string }): GrepInput {
   if (args.pattern.length === 0) throw new Error('pattern must be a non-empty string')
   if (args.path !== undefined && args.path.trim().length === 0) throw new Error('path must be a non-empty string when given')
   if (args.include !== undefined) validateInclude(args.include)
+  if (args.cursor !== undefined) parseCursorToken(args.cursor)
   return {
     pattern: args.pattern,
     ...args.path !== undefined ? { path: args.path } : {},
     ...args.include !== undefined ? { include: args.include } : {},
+    ...args.cursor !== undefined ? { cursor: args.cursor } : {},
   }
 }
 
@@ -183,19 +230,18 @@ export function parseGrepMatches(stdout: string): GrepMatch[] {
   return matches
 }
 
-/** `match` / `matches` for a count. */
-function matchNoun(count: number): string {
-  return count === 1 ? 'match' : 'matches'
-}
-
 /**
  * Group flat matches by file (first-seen order) into the model-facing body:
- * each file's display path, then one `Line N: <text>` row per match.
+ * each file's display path, then one `Line N: <text>` row per match. When
+ * `annotations` carries a git status code for a path, the code rides on the
+ * file header as ` [<code> in git]` — the fff annotation — so the model sees
+ * WHY a dirty file ranks first (it is changing right now).
  *
  * @param matches - the flat matches to render.
+ * @param annotations - optional git status codes keyed by display path (`M`, `MM`, `A`, `??`, …).
  * @returns the grouped body text.
  */
-export function formatGrepMatches(matches: GrepMatch[]): string {
+export function formatGrepMatches(matches: GrepMatch[], annotations?: ReadonlyMap<string, string>): string {
   const byFile = new Map<string, GrepMatch[]>()
   for (const match of matches) {
     const group = byFile.get(match.path)
@@ -204,37 +250,114 @@ export function formatGrepMatches(matches: GrepMatch[]): string {
   }
   const sections: string[] = []
   for (const [path, group] of byFile) {
-    sections.push(`${path}\n${group.map(m => `Line ${m.lineNumber}: ${m.line}`).join('\n')}`)
+    const code = annotations?.get(path)
+    const header = code !== undefined && code.length > 0 ? `${path} [${code} in git]` : path
+    sections.push(`${header}\n${group.map(m => `Line ${m.lineNumber}: ${m.line}`).join('\n')}`)
   }
   return sections.join('\n\n')
 }
 
 /**
- * Format the model-facing `grep` result: a found-count header, the retained
- * matches grouped by file, then — when the result was capped — a footer
- * carrying either the formatted-spill recovery locator or the could-not-save
- * explanation. The omitted count is a budget fact: the search itself completed.
+ * Slice the complete ranked match list into one {@link GrepPage}: the
+ * `maxMatches` runs starting at the cursor offset, each line previewed to
+ * `maxLineBytes`. `seen` stays the pre-page total and `truncated` reports
+ * whether any page follows, so text, search card, and continuation cursor
+ * always agree — the single page pass both `output.render` and the spill
+ * post-execute hook consume.
  *
- * @param retained - the retention outcome over every parsed match.
- * @param spillRef - the saved complete-result reference, or `undefined` when unsaved.
- * @returns the model-facing text.
+ * @param matches - every match the search parsed (ranked, in canonical order).
+ * @param cursorOffset - the flat-match offset this page starts at (0 for the first page).
+ * @param maxMatches - the page size (the `grepMaxMatches` config).
+ * @param maxLineBytes - the per-matched-line preview budget in bytes.
+ * @returns the page projection.
  */
-export function formatGrepOutput(retained: RetainedItems<GrepMatch>, spillRef: SpillRef | undefined): string {
-  const header = retained.truncated
-    ? `Found ${retained.kept} of ${retained.seen} matches`
-    : `Found ${retained.seen} ${matchNoun(retained.seen)}`
-  const body = formatGrepMatches(retained.items)
-  if (!retained.truncated) return `${header}\n\n${body}`
-  const recovery = spillRef !== undefined
-    ? `Full grep result stored at: ${spillRef.locator}. ${spillRef.retrievalHint}`
-    : 'The complete result could not be saved; narrow pattern, path, or include to see more.'
-  return `${header}\n\n${body}\n\n(${recovery})`
+export function sliceGrepPage(matches: GrepMatch[], cursorOffset: number, maxMatches: number, maxLineBytes: number): GrepPage {
+  const items = matches.slice(cursorOffset, cursorOffset + maxMatches)
+    .map(match => ({ ...match, line: previewLine(match.line, maxLineBytes) }))
+  const seen = matches.length
+  return { items, seen, truncated: cursorOffset + items.length < seen, offset: cursorOffset, pageSize: maxMatches }
 }
 
-/** Format one already-retained match list for the Native surface. */
-function formatRetainedGrep(retained: RetainedItems<GrepMatch>, spillRef?: SpillRef): string {
-  if (retained.seen === 0) return 'No matches found'
-  return formatGrepOutput(retained, spillRef)
+/** `match` / `matches` for a count. */
+function matchNoun(count: number): string {
+  return count === 1 ? 'match' : 'matches'
+}
+
+/** The 1-based page number for a cursor offset at the given page size. */
+function pageIndex(offset: number, pageSize: number): number {
+  return Math.floor(offset / pageSize) + 1
+}
+
+/** The total page count for a result of `seen` matches at the given page size. */
+function pageCount(seen: number, pageSize: number): number {
+  return Math.max(1, Math.ceil(seen / pageSize))
+}
+
+/**
+ * The {@link GrepPage} for one tool call: the canonical match list sliced from
+ * the call's cursor offset (validated at execute time) at `grepMaxMatches`.
+ * The single page pass both `output.render` and the spill post-execute hook
+ * consume, so text, search card, and continuation cursor always agree.
+ */
+function grepPageRetained(args: { cursor?: string }, matches: GrepMatch[], caps: GrepToolCaps): GrepPage {
+  const offset = args.cursor !== undefined ? parseCursorToken(args.cursor) : 0
+  return sliceGrepPage(matches, offset, caps.maxMatches, caps.maxLineBytes)
+}
+
+/** Filter a schema-typed git map (`json`-valued values) down to the real string status codes. */
+function toAnnotations(git: Record<string, unknown> | undefined): Map<string, string> | undefined {
+  const annotations = new Map<string, string>()
+  for (const [path, code] of Object.entries(git ?? {})) {
+    if (typeof code === 'string' && code.length > 0) annotations.set(path, code)
+  }
+  return annotations.size > 0 ? annotations : undefined
+}
+
+/** The model-facing text for one `grep` call page, with git annotations riding the file headers. */
+function grepPageText(
+  args: { cursor?: string },
+  value: { matches: GrepMatch[]; git?: Record<string, unknown> },
+  caps: GrepToolCaps,
+  spillRef: SpillRef | undefined,
+): string {
+  return formatGrepOutput(grepPageRetained(args, value.matches, caps), spillRef, toAnnotations(value.git))
+}
+
+/**
+ * Format the model-facing `grep` result for ONE page: a found-count header,
+ * the page's matches grouped by file, then — when the result spans further
+ * pages — a footer carrying the continuation `cursor` plus (when available)
+ * the formatted-spill recovery locator. The omitted count is a budget fact:
+ * the search itself completed; the cursor trades the rest back page by page
+ * instead of dumping it into context at once (the fff "precise positioning
+ * then read" protocol).
+ *
+ * @param page - the page projection from {@link sliceGrepPage}.
+ * @param spillRef - the saved complete-result reference, or `undefined` when unsaved.
+ * @param annotations - optional git status codes keyed by display path (fff-style `[M in git]` file headers).
+ * @returns the model-facing text.
+ */
+export function formatGrepOutput(page: GrepPage, spillRef: SpillRef | undefined, annotations?: ReadonlyMap<string, string>): string {
+  const { items, seen, truncated, offset, pageSize } = page
+  if (seen === 0) return 'No matches found'
+  if (items.length === 0) {
+    return `No more matches in this result (page ${pageIndex(offset, pageSize)} of ${pageCount(seen, pageSize)})`
+  }
+  const header = (() => {
+    // The first complete page keeps the historical plain header; any truncated
+    // page and any later page report "this page's matches of the total".
+    if (offset === 0 && !truncated) return `Found ${seen} ${matchNoun(seen)}`
+    const base = `Found ${items.length} of ${seen} matches`
+    if (offset === 0) return base
+    return `${base} (page ${pageIndex(offset, pageSize)} of ${pageCount(seen, pageSize)})`
+  })()
+  const body = formatGrepMatches(items, annotations)
+  if (!truncated) return `${header}\n\n${body}`
+  const next = cursorToken(offset + items.length)
+  const recovery = spillRef !== undefined
+    ? `Full grep result stored at: ${spillRef.locator}. ${spillRef.retrievalHint}`
+    : 'The complete result could not be saved.'
+  return `${header}\n\n${body}\n\n(${recovery} Continue with cursor="${next}" for the next page.)`
 }
 
 /**
@@ -318,19 +441,21 @@ async function grepInternalUrl(
 export function applyGrepTool(ctx: Context, caps: GrepToolCaps): void {
   ctx.systemPrompt.section({
     name: 'tool:grep',
-    order: 104,
-    text: 'Use the grep tool — not shell grep or rg — to search file contents. Use read on a matched file when you need surrounding context.',
+    order: ctx.systemPrompt.getSectionOrder('TOOL_GREP'),
+    text: 'Use the grep tool — not shell grep or rg — to search file contents. Results are ranked so git-modified files come first (marked [M in git]). '
+      + `A capped grep returns the first ${caps.maxMatches} matches plus a continuation cursor — pass the cursor back unchanged with the same pattern/path/include to fetch the next page; read the top match instead of paging deep. Use read on a matched file for surrounding context.`,
   })
 
   const tool = defineTool({
     name: 'grep',
-    description: 'Search file contents with a ripgrep regular expression. Returns matching lines with line numbers, grouped by file. '
-      + `Returns the first ${caps.maxMatches} matches inline; a capped result reports where the complete match list was saved. `
+    description: 'Search file contents with a ripgrep regular expression. Returns matching lines with line numbers, grouped by file, ranked so git-modified files come first. '
+      + `Returns the first ${caps.maxMatches} matches inline; a capped result returns a continuation cursor — pass it back unchanged (same pattern/path/include) to fetch the next page, or follow the spill locator for the complete result. `
       + 'Use read on a matched file for surrounding context.',
     parameters: {
       pattern: { type: 'string', required: true, description: 'Regular expression to search for (ripgrep syntax).' },
       path: { type: 'string', description: 'File, directory, or internal URL (e.g. conflict://3, pr://owner/repo/123/diff) to search. Defaults to the session workspace; a relative path resolves against it.' },
       include: { type: 'string', description: 'One glob filter for which files to search (e.g. "*.ts", "*.{js,jsx}"). Not a list; negation is not supported.' },
+      cursor: { type: 'string', description: 'Opaque continuation token returned by a capped previous result. Pass it back unchanged with the same pattern, path, and include to fetch the next page.' },
     },
     timeoutMs: caps.timeoutMs,
     output: {
@@ -351,14 +476,16 @@ export function applyGrepTool(ctx: Context, caps: GrepToolCaps): void {
               },
             },
           },
+          git: {
+            type: 'object',
+            additionalProperties: true,
+            description: 'Git-dirty files this search matched, keyed by display path with the compact porcelain status code ("M", "MM", "A", "D", "??", "R", …). Present only when the workdir is inside a git repo and at least one dirty file matched.',
+          },
         },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: formatRetainedGrep(retainGrepMatches(value.matches, caps.maxMatches, caps.maxLineBytes)),
-      }],
-      presentationMeta: (_args, value) =>
-        grepSearchMeta(retainGrepMatches(value.matches, caps.maxMatches, caps.maxLineBytes), caps.maxMetaBytes),
+      render: (args, value) => [{ type: 'text', text: grepPageText(args, value, caps, undefined) }],
+      presentationMeta: (args, value) =>
+        grepSearchMeta(grepPageRetained(args, value.matches, caps), caps.maxMetaBytes),
     },
     async execute(args, exec) {
       const input = parseGrepArgs(args)
@@ -388,7 +515,20 @@ export function applyGrepTool(ctx: Context, caps: GrepToolCaps): void {
         }
         all.push(match)
       }
-      return { matches: all }
+      // Git-aware ranking (the fff "modified files first" signal, index-free:
+      // one porcelain probe, then a stable partition): dirty files surface on
+      // page one instead of being buried behind noise in untouched files.
+      if (!caps.gitRank) return { matches: all }
+      const dirty = await gitDirtyPaths(ctx, exec)
+      if (dirty === undefined) return { matches: all }
+      const ranked = rankGrepMatchesByDirty(all, dirty)
+      const gitEntries = new Map<string, string>()
+      for (const match of ranked) {
+        const code = dirty.get(match.path)
+        if (!gitEntries.has(match.path) && code !== undefined) gitEntries.set(match.path, code)
+      }
+      if (gitEntries.size === 0) return { matches: ranked }
+      return { matches: ranked, git: Object.fromEntries(gitEntries) }
     },
     presentCall: presentGrepCall,
     presentResult: presentGrepResult,
@@ -397,7 +537,8 @@ export function applyGrepTool(ctx: Context, caps: GrepToolCaps): void {
 
   ctx.on('tools/post-execute', async (exec, result, next) => {
     const decision = await next()
-    const value = acceptedDirectCallValue(ctx, tool, exec, result, decision) as { matches: GrepMatch[] } | undefined
+    const value = acceptedDirectCallValue(ctx, tool, exec, result, decision) as
+      { matches: GrepMatch[]; git?: Record<string, string> } | undefined
     if (value === undefined) return decision
     const matches = value.matches
     if (matches.length <= caps.maxMatches) return decision
@@ -410,11 +551,12 @@ export function applyGrepTool(ctx: Context, caps: GrepToolCaps): void {
       'grep-results.txt',
       `Found ${matches.length} ${matchNoun(matches.length)}\n\n${formatGrepMatches(previewedAll)}`,
     )
+    const args = exec.arguments as { cursor?: string; pattern?: string; path?: string; include?: string } | undefined
     return {
       kind: 'accept',
       content: [{
         type: 'text',
-        text: formatRetainedGrep(retainGrepMatches(matches, caps.maxMatches, caps.maxLineBytes), spillRef),
+        text: formatGrepOutput(grepPageRetained(args ?? {}, matches, caps), spillRef, toAnnotations(value.git)),
       }],
       ...decision.additionalContexts !== undefined ? { additionalContexts: decision.additionalContexts } : {},
     }

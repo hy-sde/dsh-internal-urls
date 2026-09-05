@@ -8,7 +8,7 @@ disk; a purely virtual resource is materialized to a per-call temp file,
 searched, and removed — the reported path is always the URL). This is the
 hy-sde fork's `dsh-tool-fs-search` (with the `src/grep.ts` routing hunks)
 shipped as an agent-scope shadow so it works on **stock** DeepSeek Harness
-releases (`dsh-v0.1.2-alpha.1` and later).
+releases (`dsh-v0.1.2-rc.1` and later).
 
 Mount it in an agent preset (see `examples/agent-preset/` in
 `@hy-sde-org/dsh-internal-urls`), beside
@@ -17,9 +17,12 @@ registry the routing branch never triggers and `grep`/`glob` are
 stock-equivalent (`@vscode/ripgrep` ships inside this npm dependency, so no
 system `rg` install is required).
 
-- `grep` — ripgrep `--json` parsing, 250-match inline retention with spill
-  recovery, workdir-relative display, grouped by file. Also searches internal
-  URL resources (`path: 'conflict://3'`, `'pr://owner/repo/123/diff'`, …).
+- `grep` — ripgrep `--json` parsing, 50-match inline pages with a
+  continuation cursor (pass it back unchanged with the same pattern/path/
+  include), git-dirty files ranked first (`[M in git]` headers) and shown
+  workdir-relative, grouped by file, with spill recovery for the complete
+  result. Also searches internal URL resources (`path: 'conflict://3'`,
+  `'pr://owner/repo/123/diff'`, …).
 - `glob` — pattern discovery with over-cap sampling, unchanged from the harness.
 
 ## Install
@@ -42,8 +45,9 @@ this repo (or the installed package) to `~/.dsh/.agent-presets/<id>/` — its
 
 | Key | Default | Meaning |
 |---|---|---|
-| `grepMaxMatches` | `250` | flat matches retained inline per call |
+| `grepMaxMatches` | `50` | page size: flat matches retained inline per call; later matches ride the continuation cursor |
 | `grepMaxLineBytes` | `2000` | bytes per matched-line preview |
+| `grepGitRank` | `true` | one `git status` probe per call ranks git-dirty files first and annotates them `[M in git]` |
 | `searchMetaMaxBytes` | `64 KiB` | serialized presentation meta cap |
 | `rawOutputMaxBytes` | `20 MiB` | raw `rg` stdout parse cap |
 | `graceMs` | `3000` | terminate grace for the search process |

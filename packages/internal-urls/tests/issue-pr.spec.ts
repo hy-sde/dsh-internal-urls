@@ -88,6 +88,22 @@ describe('parseIssuePrUrl', () => {
     expect(() => parseIssuePrUrl(parseInternalUrl('pr://1/diff/bogus'), 'pr')).toThrow(/Invalid pr:\/\/ diff sub-path/)
     expect(() => parseIssuePrUrl(parseInternalUrl('issue://1/diff'), 'issue')).toThrow(/do not have a diff/)
   })
+  it('parses GitHub Enterprise host-prefixed forms', () => {
+    // Dotted hosts prefix every shape: <host>/<owner>/<repo>[/N][/diff...].
+    const gheList = parseIssuePrUrl(parseInternalUrl('pr://ghe.example.com/owner/repo'), 'pr')
+    expect(gheList).toMatchObject({ kind: 'list', repo: 'ghe.example.com/owner/repo', state: 'open' })
+    const gheSingle = parseIssuePrUrl(parseInternalUrl('issue://ghe.example.com/owner/repo/42?comments=0'), 'issue')
+    expect(gheSingle).toMatchObject({ kind: 'single', repo: 'ghe.example.com/owner/repo', number: 42, comments: false })
+    const gheDiff = parseIssuePrUrl(parseInternalUrl('pr://ghe.example.com/owner/repo/7/diff/2'), 'pr')
+    expect(gheDiff).toMatchObject({ kind: 'pr-diff', repo: 'ghe.example.com/owner/repo', number: 7, mode: 'slice', index: 2 })
+    // Single-label hosts are recognized only in the numbered form.
+    expect(() => parseIssuePrUrl(parseInternalUrl('pr://ghe/owner/repo'), 'pr')).toThrow(/Invalid pr:\/\/ number: repo/)
+    const shortSingle = parseIssuePrUrl(parseInternalUrl('issue://ghe/owner/repo/3'), 'issue')
+    expect(shortSingle).toMatchObject({ kind: 'single', repo: 'ghe/owner/repo', number: 3 })
+    // A dotted host with no repo segments is rejected before shape handling.
+    expect(() => parseIssuePrUrl(parseInternalUrl('issue://ghe.example.com'), 'issue')).toThrow(/issue:\/\/<host>\/<owner>\/<repo>/)
+    expect(() => parseIssuePrUrl(parseInternalUrl('pr://ghe.example.com/owner'), 'pr')).toThrow(/pr:\/\/<host>\/<owner>\/<repo>/)
+  })
 })
 
 describe('splitPrDiff', () => {

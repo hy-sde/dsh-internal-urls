@@ -2,7 +2,7 @@
  * GitHub-as-filesystem: `issue://` and `pr://` protocol handlers that resolve
  * through the `gh` CLI so read/grep can consume issues, pull requests, and PR
  * diffs without tool sprawl. Ported in shape from oh-my-pi
- * (`packages/coding-agent/src/internal-urls/issue-pr-protocol.ts`), MIT; the
+ * (`coding-agent/src/internal-urls/issue-pr-protocol.ts`), MIT; the
  * fetching layer is injectable for tests.
  *
  * URL shapes:
@@ -104,10 +104,37 @@ function parseListOptions(url: ParsedInternalUrl, scheme: Scheme, repo: string |
 
 /**
  * Parse an `issue://`/`pr://` URL into the union shape. Pure and exported for tests.
+ *
+ * GitHub Enterprise and other self-hosted GitHub instances are addressed by a
+ * leading `<host>/` prefix: `issue://ghe.example.com/owner/repo/1` resolves
+ * `owner/repo` on that host. A dotted first segment can only be a host, because
+ * GitHub owner names are alphanumeric-plus-hyphen, so dotted hosts work with
+ * every shape below. A single-label host (`ghe`, `localhost`) is only
+ * recognizable from the item number's position, so it is accepted in the
+ * numbered form alone — `<host>/<owner>/<repo>` with no number is
+ * indistinguishable from `<owner>/<repo>/<bad-number>`, and keeping the
+ * latter's error beats guessing.
  */
 export function parseIssuePrUrl(url: ParsedInternalUrl, scheme: Scheme): Parsed {
-  const host = url.rawHost
-  const parts = url.pathSegments
+  let host = url.rawHost
+  let parts = url.pathSegments
+  // A leading `<host>/` prefix (GitHub Enterprise et al.), stripped out so the
+  // shape rules below see `OWNER/REPO[/N]` exactly as they do on github.com.
+  let repoHost: string | undefined
+  const dottedHost = host.includes('.')
+  if (dottedHost && parts.length < 2) {
+    throw new Error(
+      `Invalid ${scheme}:// URL. Expected ${scheme}://<host>/<owner>/<repo> or ${scheme}://<host>/<owner>/<repo>/<number>`,
+    )
+  }
+  const hostPrefixed = dottedHost
+    ? parts.length >= 2
+    : parts.length >= 3 && parsePositiveDecimalInt(parts[2] ?? '') !== undefined
+  if (hostPrefixed) {
+    repoHost = host
+    host = parts[0] ?? ''
+    parts = parts.slice(1)
+  }
 
   if (!host && parts.length === 0) {
     return parseListOptions(url, scheme, undefined)
@@ -133,11 +160,11 @@ export function parseIssuePrUrl(url: ParsedInternalUrl, scheme: Scheme): Parsed 
   }
   if (host && parts.length === 1) {
     // scheme://owner/repo → list
-    return parseListOptions(url, scheme, `${host}/${parts[0]}`)
+    return parseListOptions(url, scheme, formatRepoRef(repoHost, `${host}/${parts[0]}`))
   }
   if (host && parts.length >= 2) {
     // scheme://owner/repo/N[/diff[/<sub>]]
-    const repo = `${host}/${parts[0]}`
+    const repo = formatRepoRef(repoHost, `${host}/${parts[0]}`)
     const numberPart = parts[1]
     const num = parsePositiveDecimalInt(numberPart ?? '')
     if (num === undefined) {
@@ -156,6 +183,11 @@ export function parseIssuePrUrl(url: ParsedInternalUrl, scheme: Scheme): Parsed 
     return { kind: 'single', repo, number: num, comments: commentsOn(url) }
   }
   throw new Error(`Invalid ${scheme}:// URL. Expected ${scheme}://, ${scheme}://<number>, ${scheme}://<owner>/<repo>, or ${scheme}://<owner>/<repo>/<number>`)
+}
+
+/** Join a known enterprise host and `OWNER/REPO` into the `--repo` form `gh` accepts. */
+function formatRepoRef(host: string | undefined, slug: string): string {
+  return host ? `${host}/${slug}` : slug
 }
 
 /** Split the diff sub-path and range-check the index/slice. */
