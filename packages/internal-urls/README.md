@@ -4,8 +4,8 @@ FS-shaped **internal URL schemes** for DeepSeek Harness: `conflict://`,
 `issue://`, and `pr://` resolved through one resolver registry
 (`ctx.internalUrls`) that the read/grep/write tools consult before touching
 the filesystem. Ported from the [@oh-my-pi](https://github.com/oh-my-pi)
-coding-agent `internal-urls` system (see `port_omp.md` — the port lives in
-the [hy-sde fork](https://github.com/hy-sde/deepseek-harness)) and shipped as
+coding-agent `internal-urls` system (the port lives in the
+[hy-sde fork](https://github.com/hy-sde/deepseek-harness)) and shipped as
 a **standalone plugin**: the registry row installs via `cordis.patch.yml`, and
 the routing tools install as agent-scope shadows
 (`@hy-sde-org/dsh-tool-fs-internal-urls` /

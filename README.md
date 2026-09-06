@@ -9,8 +9,8 @@ Harness CLI:
 | `@hy-sde-org/dsh-tool-fs-internal-urls` | agent-scope shadow of `read`/`write`/`edit` that routes internal URLs (fork `dsh-tool-fs` + routing) | yes (via preset) |
 | `@hy-sde-org/dsh-tool-fs-search-internal-urls` | agent-scope shadow of `grep` that searches internal-URL resources (fork `dsh-tool-fs-search` + routing) | yes (via preset) |
 
-This is the oh-my-pi `internal-urls` system (portal `port_omp.md`) ported onto
-the harness as a **standalone plugin with zero upstream harness changes**: the
+This is the oh-my-pi `internal-urls` system, ported onto the harness as a
+**standalone plugin with zero upstream harness changes**: the
 registry row ships as a `cordis.patch.yml` bundle, the routing tools ship as
 agent-scope shadows in a ready-to-copy preset, and every `@deepseek-ai`
 dependency resolves from the npm registry at the `0.1.2-rc.1` baseline — so
