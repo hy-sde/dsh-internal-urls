@@ -16,6 +16,8 @@ import { ConflictHistory, ConflictProtocolHandler } from './conflict.ts'
 import type { ConflictFileBridge } from './conflict.ts'
 import { defaultRepoFromCwd } from './gh.ts'
 import { IssueProtocolHandler, PrProtocolHandler, gitHubCliOf } from './issue-pr.ts'
+import { AgentProtocolHandler } from './agent-protocol.ts'
+import { sessionQueryOutputStore } from './session-query-store.ts'
 import { InternalUrlRouter } from './router.ts'
 import type { InternalResource, ProtocolHandler, ResolveContext, UrlCompletion, WriteContext } from './types.ts'
 
@@ -25,6 +27,8 @@ export * from './router.ts'
 export * from './conflict.ts'
 export * from './gh.ts'
 export * from './issue-pr.ts'
+export * from './agent-protocol.ts'
+export * from './session-query-store.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -121,7 +125,7 @@ function conflictFileBridgeOf(ctx: Context): ConflictFileBridge {
 
 /**
  * Register `ctx.internalUrls` and its shipped handlers (`conflict://`,
- * `issue://`, `pr://`). Constructing the Service registers `ctx.internalUrls`
+ * `issue://`, `pr://`, `agent://`). Constructing the Service registers `ctx.internalUrls`
  * for the mounting fiber; handler registrations are effects scoped to the same
  * fiber, so stop/update removes every handler with it.
  */
@@ -146,6 +150,13 @@ export function apply(ctx: Context): void {
   }
   disposers.push(service.register(new IssueProtocolHandler(ghDeps)))
   disposers.push(service.register(new PrProtocolHandler(ghDeps)))
+  // The `agent://` scheme registers unconditionally; the session-query store
+  // behind it is an OPTIONAL peer (`@deepseek-ai/dsh-session-query`), resolved
+  // lazily at resolve time, so a deployment without the service keeps the
+  // handler mounted and surfaces its corrective "outputs unavailable" error.
+  disposers.push(service.register(new AgentProtocolHandler({
+    outputStore: () => sessionQueryOutputStore(ctx.get('sessionQuery')),
+  })))
 }
 
 export default apply

@@ -1,7 +1,7 @@
 # @hy-sde-org/dsh-internal-urls
 
 FS-shaped **internal URL schemes** for DeepSeek Harness: `conflict://`,
-`issue://`, and `pr://` resolved through one resolver registry
+`issue://`, `pr://`, and `agent://` resolved through one resolver registry
 (`ctx.internalUrls`) that the read/grep/write tools consult before touching
 the filesystem. Ported from the [@oh-my-pi](https://github.com/oh-my-pi)
 coding-agent `internal-urls` system (the port lives in the
@@ -25,6 +25,15 @@ DeepSeek Harness (`dsh-v0.1.2-rc.1` and later) needs to change.
   `issue://owner/repo`, `issue://123`, `issue://owner/repo/123`,
   `pr://N/diff`, `pr://N/diff/all`, `pr://N/diff/<i>`, list options
   (`?state=open&limit=30`, `?comments=0`).
+- `agent://<id>` — one subagent's final assistant output (a child session id
+  with `origin === 'subagent'`). `agent://<parent>/<child>` walks the
+  `parentSession` chain to a nested child output. Outputs are read-only
+  markdown backed by the published `@deepseek-ai/dsh-session-query` service
+  (`ctx.sessionQuery`), which is an **optional peer**: without it every
+  `agent://` read reports a corrective "outputs unavailable" error instead of
+  failing registration. The omp `?q=` JSON extraction form is **not
+  supported** — agent outputs are markdown, not jq-able documents — and
+  returns an explicit error.
 
 ## Install
 
@@ -85,8 +94,11 @@ iu.conflicts(sessionKey)                     // per-session ConflictHistory
 ```
 
 Handlers are plain objects (`{ scheme, immutable, resolve, write?, complete? }`)
-registered per scheme; the shipped `conflict://`, `issue://`, `pr://`
-handlers mount with the plugin and are removed on unmount.
+registered per scheme; the shipped `conflict://`, `issue://`, `pr://`,
+`agent://` handlers mount with the plugin and are removed on unmount. The
+`agent://` handler resolves its session-query store lazily at resolve time, so
+deployments without the optional `@deepseek-ai/dsh-session-query` peer keep
+the registry healthy.
 
 ## Config (the `internal-urls` row)
 
