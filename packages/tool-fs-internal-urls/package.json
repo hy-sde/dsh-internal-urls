@@ -1,6 +1,6 @@
 {
   "name": "@hy-sde-org/dsh-tool-fs-internal-urls",
-  "version": "0.1.2-rc.1",
+  "version": "0.1.2-rc.2",
   "description": "Agent-scope shadow of the DeepSeek Harness read/write/edit fs tools that also resolves conflict://, pr://, issue:// URLs through ctx.internalUrls — the routing surface that makes internal URLs work on stock harness releases.",
   "type": "module",
   "main": "./dist/index.js",

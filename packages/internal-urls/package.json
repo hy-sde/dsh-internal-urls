@@ -1,6 +1,6 @@
 {
   "name": "@hy-sde-org/dsh-internal-urls",
-  "version": "0.1.2-rc.1",
+  "version": "0.1.2-rc.2",
   "description": "FS-shaped internal URL schemes (conflict://, pr://, issue://, …) resolved through one registry behind the read/grep/write tools — a standalone service plugin for DeepSeek Harness with no upstream harness changes required.",
   "type": "module",
   "main": "./dist/index.js",
